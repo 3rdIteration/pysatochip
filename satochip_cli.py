@@ -1319,9 +1319,9 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                         logger.warning(f"Error during passphrase decoding: {ex}")
                         passphrase = f"failed to decode passphrase bytes: {passphrase_bytes.hex()}"
 
-                    secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'  
+                    secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'
 
-                elif stype == 'Password':
+                elif stype in ('Password', 'Descriptor'):
                     secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
 
                 else:
