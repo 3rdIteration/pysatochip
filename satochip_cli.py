@@ -1340,7 +1340,6 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                     if login_length > 0:
                         login_text = binascii.unhexlify(secret_dict['secret'])[
                                      password_length + 2: password_length + login_length + 2].decode()
-
                         secret_string += "\nLogin:" + "\"" + login_text + "\""
 
                     if url_length > 0:
