@@ -1321,7 +1321,10 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
 
                     secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'
 
-                elif stype in ('Password', 'Descriptor'):
+                elif stype == 'Password':
+                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
+
+                elif stype in ('Descriptor', 'Data'):
                     secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
 
                 else:
