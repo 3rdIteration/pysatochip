@@ -1322,7 +1322,6 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                     secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'
 
                 elif stype == 'Password':
-                    print(secret_dict)
 
                     password_length = secret_dict['secret_list'][0]
                     try:
