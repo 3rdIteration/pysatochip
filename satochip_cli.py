@@ -1322,10 +1322,34 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                     secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'
 
                 elif stype == 'Password':
-                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
+                    print(secret_dict)
+
+                    password_length = secret_dict['secret_list'][0]
+                    try:
+                        login_length = secret_dict['secret_list'][password_length + 1]
+                        url_length = secret_dict['secret_list'][password_length + login_length + 2]
+                    except IndexError: # Older Seedkeeper software didn't include these optional fields
+                        login_length = 0
+                        url_length = 0
+
+                    secret_string = ""
+
+                    # Password is always present, so no need to test for this
+                    password_text = binascii.unhexlify(secret_dict['secret']).decode()[1:1 + password_length]
+                    secret_string += "\nPassword:" + "\"" + password_text + "\""
+
+                    if login_length > 0:
+                        login_text = binascii.unhexlify(secret_dict['secret']).decode()[
+                                     password_length + 2: password_length + login_length + 2]
+
+                        secret_string += "\nLogin:" + "\"" + login_text + "\""
+
+                    if url_length > 0:
+                        url_text = binascii.unhexlify(secret_dict['secret']).decode()[-url_length:]
+                        secret_string += "\nURL:" + "\"" + url_text + "\""
 
                 elif stype in ('Descriptor', 'Data'):
-                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
+                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[2:].decode() + "\""
 
                 else:
                     secret_string = "\"" + secret_dict['secret'][2:] + "\""
