@@ -1334,17 +1334,17 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                     secret_string = ""
 
                     # Password is always present, so no need to test for this
-                    password_text = binascii.unhexlify(secret_dict['secret']).decode()[1:1 + password_length]
+                    password_text = binascii.unhexlify(secret_dict['secret'])[1:password_length+1].decode()
                     secret_string += "\nPassword:" + "\"" + password_text + "\""
 
                     if login_length > 0:
-                        login_text = binascii.unhexlify(secret_dict['secret']).decode()[
-                                     password_length + 2: password_length + login_length + 2]
+                        login_text = binascii.unhexlify(secret_dict['secret'])[
+                                     password_length + 1: password_length + login_length + 2].decode()
 
                         secret_string += "\nLogin:" + "\"" + login_text + "\""
 
                     if url_length > 0:
-                        url_text = binascii.unhexlify(secret_dict['secret']).decode()[-url_length:]
+                        url_text = binascii.unhexlify(secret_dict['secret'])[-url_length:].decode()
                         secret_string += "\nURL:" + "\"" + url_text + "\""
 
                 elif stype in ('Descriptor', 'Data'):
