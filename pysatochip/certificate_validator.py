@@ -147,7 +147,7 @@ class CertificateValidator:
         txt_ca = txt_subca = txt_device = "OpenSSL module not available"
         device_pubkey = bytes(65 * [0])
         try:
-            from Cryptodome.Util.asn1 import DerSequence, DerObjectId, DerBitString, DerObject
+            from Cryptodome.Util.asn1 import DerSequence, DerSetOf, DerObjectId, DerBitString, DerObject
             from Cryptodome.Hash import SHA256, SHA384, SHA512
             from ecdsa import VerifyingKey, NIST384p, SECP256k1, util
             import re, base64
@@ -184,7 +184,7 @@ class CertificateValidator:
                 seq = DerSequence(); seq.decode(der)
                 attrs = {}
                 for rdn in seq:
-                    set_seq = DerSequence(); set_seq.decode(rdn)
+                    set_seq = DerSetOf(); set_seq.decode(rdn)
                     attr_seq = DerSequence(); attr_seq.decode(set_seq[0])
                     oid = DerObjectId(); oid.decode(attr_seq[0])
                     value_obj = DerObject(); value_obj.decode(attr_seq[1])
@@ -271,7 +271,7 @@ class CertificateValidator:
         return self._parse_pem_certificate_pycryptodomex(cert_pem)
 
     def _parse_pem_certificate_pycryptodomex(self, cert_pem):
-        from Cryptodome.Util.asn1 import DerSequence, DerObjectId, DerObject
+        from Cryptodome.Util.asn1 import DerSequence, DerSetOf, DerObjectId, DerObject
         import base64, re
         from datetime import datetime
 
@@ -295,7 +295,7 @@ class CertificateValidator:
             seq = DerSequence(); seq.decode(der)
             attrs = {}
             for rdn in seq:
-                set_seq = DerSequence(); set_seq.decode(rdn)
+                set_seq = DerSetOf(); set_seq.decode(rdn)
                 attr_seq = DerSequence(); attr_seq.decode(set_seq[0])
                 oid = DerObjectId(); oid.decode(attr_seq[0])
                 value_obj = DerObject(); value_obj.decode(attr_seq[1])
