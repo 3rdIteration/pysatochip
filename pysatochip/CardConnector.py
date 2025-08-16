@@ -12,7 +12,7 @@ from .TxParser import TxParser
 from .ecc import ECPubkey, ECPrivkey
 from .SecureChannel import SecureChannel
 from .util import msg_magic, sha256d, hash_160, EncodeBase58Check, dict_swap_keys_values
-#from .certificate_validator import CertificateValidator
+from .certificate_validator import CertificateValidator
 
 import hashlib
 import hmac
@@ -2513,7 +2513,7 @@ class CardConnector:
         
         return verif;
     
-    def card_verify_authenticity(self):
+    def card_verify_authenticity(self, backend: str = "auto"):
         logger.debug('In card_verify_authenticity')
         
         # get certificate from device
@@ -2537,7 +2537,7 @@ class CardConnector:
             return False, txt_ca, txt_subca, txt_device, txt_error
 
         # Perform some checks on the certificate
-        validator = CertificateValidator()
+        validator = CertificateValidator(backend=backend)
 
         # Check that the certificate subject matches the device serial number
         cert_dict =  validator.parse_pem_certificate(cert_pem)
