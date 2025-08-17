@@ -140,32 +140,28 @@ class RemovalObserver(CardObserver):
                         self.cc.card_initiate_secure_channel()
 
                     if status_ready:
-                        last_exc = None
-                        for _ in range(3):
-                            try:
-                                (response_CPLC, sw1, sw2) = self.cc.card_get_CPLC()
-                                if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(response_CPLC, sw1, sw2)
-                                logger.debug(f"DEBUG CPLC: {bytes(response_CPLC).hex()}")
-                                (response_IIN, sw1, sw2) = self.cc.card_get_IIN()
-                                if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(response_IIN, sw1, sw2)
-                                logger.debug(f"DEBUG IIN: {bytes(response_IIN).hex()}")
-                                (response_CIN, sw1, sw2) = self.cc.card_get_CIN()
-                                if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(response_CIN, sw1, sw2)
-                                logger.debug(f"DEBUG CIN: {bytes(response_CIN).hex()}")
-                                self.cc.UID= response_CPLC+response_IIN+response_CIN
-                                logger.debug(f"DEBUG UID: {bytes(self.cc.UID).hex()}")
-                                self.cc.UID_SHA1= hashlib.sha1(bytes(self.cc.UID)).hexdigest()
-                                logger.debug(f"DEBUG UID_SHA1: {self.cc.UID_SHA1}")
-                                break
-                            except Exception as exc:
-                                last_exc = exc
-                                logger.warning(f"Error during CPLC/IIN/CIN: {repr(exc)}")
-                                time.sleep(0.1)
-                        else:
-                            raise last_exc if last_exc else Exception("Failed to fetch CPLC/IIN/CIN")
+                        def fetch_with_retry(cmd, name):
+                            last_exc = None
+                            for _ in range(3):
+                                try:
+                                    response, sw1, sw2 = cmd()
+                                    if sw1 == 0x90 and sw2 == 0x00:
+                                        logger.debug(f"DEBUG {name}: {bytes(response).hex()}")
+                                        return response
+                                    raise SWException(response, sw1, sw2)
+                                except Exception as exc:
+                                    last_exc = exc
+                                    logger.warning(f"Error fetching {name}: {repr(exc)}")
+                                    time.sleep(0.1)
+                            raise last_exc if last_exc else Exception(f"Failed to fetch {name}")
+
+                        response_CPLC = fetch_with_retry(self.cc.card_get_CPLC, "CPLC")
+                        response_IIN = fetch_with_retry(self.cc.card_get_IIN, "IIN")
+                        response_CIN = fetch_with_retry(self.cc.card_get_CIN, "CIN")
+                        self.cc.UID = response_CPLC + response_IIN + response_CIN
+                        logger.debug(f"DEBUG UID: {bytes(self.cc.UID).hex()}")
+                        self.cc.UID_SHA1 = hashlib.sha1(bytes(self.cc.UID)).hexdigest()
+                        logger.debug(f"DEBUG UID_SHA1: {self.cc.UID_SHA1}")
 
                 # todo: skip or not for reset_factory?
                 if self.cc.client is not None:
@@ -173,9 +169,10 @@ class RemovalObserver(CardObserver):
                 
             except Exception as exc:
                 logger.warning(f"Error during connection: {repr(exc)}")
+                self.cc.card_disconnect()
                 if self.cc.client is not None:
                     msg=(f"Exception while selecting card! \nOnly {self.cc.card_filter} cards are supported")
-                    self.cc.client.request('show_error',msg)   
+                    self.cc.client.request('show_error',msg)
                 
         for card in removedcards:
             logger.info(f"-Removed: {toHexString(card.atr)}")
