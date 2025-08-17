@@ -144,15 +144,15 @@ class RemovalObserver(CardObserver):
                             try:
                                 (response_CPLC, sw1, sw2) = self.cc.card_get_CPLC()
                                 if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(hex((sw1<<8)+sw2))
+                                    raise SWException(response_CPLC, sw1, sw2)
                                 logger.debug(f"DEBUG CPLC: {bytes(response_CPLC).hex()}")
                                 (response_IIN, sw1, sw2) = self.cc.card_get_IIN()
                                 if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(hex((sw1<<8)+sw2))
+                                    raise SWException(response_IIN, sw1, sw2)
                                 logger.debug(f"DEBUG IIN: {bytes(response_IIN).hex()}")
                                 (response_CIN, sw1, sw2) = self.cc.card_get_CIN()
                                 if sw1!=0x90 or sw2!=0x00:
-                                    raise SWException(hex((sw1<<8)+sw2))
+                                    raise SWException(response_CIN, sw1, sw2)
                                 logger.debug(f"DEBUG CIN: {bytes(response_CIN).hex()}")
                                 self.cc.UID= response_CPLC+response_IIN+response_CIN
                                 logger.debug(f"DEBUG UID: {bytes(self.cc.UID).hex()}")
