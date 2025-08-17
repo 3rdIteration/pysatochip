@@ -140,6 +140,7 @@ class RemovalObserver(CardObserver):
                         self.cc.card_initiate_secure_channel()
 
                     if status_ready:
+                        last_exc = None
                         for _ in range(3):
                             try:
                                 (response_CPLC, sw1, sw2) = self.cc.card_get_CPLC()
@@ -160,8 +161,11 @@ class RemovalObserver(CardObserver):
                                 logger.debug(f"DEBUG UID_SHA1: {self.cc.UID_SHA1}")
                                 break
                             except Exception as exc:
+                                last_exc = exc
                                 logger.warning(f"Error during CPLC/IIN/CIN: {repr(exc)}")
                                 time.sleep(0.1)
+                        else:
+                            raise last_exc if last_exc else Exception("Failed to fetch CPLC/IIN/CIN")
 
                 # todo: skip or not for reset_factory?
                 if self.cc.client is not None:
