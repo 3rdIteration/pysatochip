@@ -17,6 +17,7 @@ from .certificate_validator import CertificateValidator
 import hashlib
 import hmac
 import base64
+import time
 import logging
 from os import urandom
 from typing import Union
@@ -114,23 +115,7 @@ class RemovalObserver(CardObserver):
             self.cc.cardservice.connection = card.createConnection()
             self.cc.cardservice.connection.connect()
             self.cc.cardservice.connection.addObserver(self.observer)
-            
-            # get CPLC
-            try:
-                (response_CPLC, sw1, sw2) = self.cc.card_get_CPLC()
-                logger.debug(f"DEBUG CPLC: {bytes(response_CPLC).hex()}")
-                (response_IIN, sw1, sw2) = self.cc.card_get_IIN()
-                logger.debug(f"DEBUG IIN: {bytes(response_IIN).hex()}")
-                (response_CIN, sw1, sw2) = self.cc.card_get_CIN()
-                logger.debug(f"DEBUG CIN: {bytes(response_CIN).hex()}")
-                self.cc.UID= response_CPLC+response_IIN+response_CIN
-                logger.debug(f"DEBUG UID: {bytes(self.cc.UID).hex()}")
-                self.cc.UID_SHA1= hashlib.sha1(bytes(self.cc.UID)).hexdigest()
-                logger.debug(f"DEBUG UID_SHA1: {self.cc.UID_SHA1}")
-            except Exception as exc:
-                logger.warning(f"Error during CPLC/IIN/CIN: {repr(exc)}")
-                
-            #select applet
+
             try:
                 (response, sw1, sw2) = self.cc.card_select()
                 if sw1!=0x90 or sw2!=0x00:
@@ -138,17 +123,49 @@ class RemovalObserver(CardObserver):
                     break
 
                 # During factory reset, we should not send other commands than reset...
+                status_ready = False
                 if self.cc.mode_factory_reset == False:
-                    (response, sw1, sw2, status)= self.cc.card_get_status()
+                    for _ in range(3):
+                        (response, sw1, sw2, status)= self.cc.card_get_status()
+                        if sw1==0x90 and sw2==0x00:
+                            status_ready = True
+                            break
+                        elif sw1==0x9C and sw2==0x04:
+                            break
+                        time.sleep(0.1)
                     if (sw1!=0x90 or sw2!=0x00) and (sw1!=0x9C or sw2!=0x04):
                         self.cc.card_disconnect()
                         break
                     if (self.cc.needs_secure_channel):
                         self.cc.card_initiate_secure_channel()
-                
+
+                    if status_ready:
+                        for _ in range(3):
+                            try:
+                                (response_CPLC, sw1, sw2) = self.cc.card_get_CPLC()
+                                if sw1!=0x90 or sw2!=0x00:
+                                    raise SWException(hex((sw1<<8)+sw2))
+                                logger.debug(f"DEBUG CPLC: {bytes(response_CPLC).hex()}")
+                                (response_IIN, sw1, sw2) = self.cc.card_get_IIN()
+                                if sw1!=0x90 or sw2!=0x00:
+                                    raise SWException(hex((sw1<<8)+sw2))
+                                logger.debug(f"DEBUG IIN: {bytes(response_IIN).hex()}")
+                                (response_CIN, sw1, sw2) = self.cc.card_get_CIN()
+                                if sw1!=0x90 or sw2!=0x00:
+                                    raise SWException(hex((sw1<<8)+sw2))
+                                logger.debug(f"DEBUG CIN: {bytes(response_CIN).hex()}")
+                                self.cc.UID= response_CPLC+response_IIN+response_CIN
+                                logger.debug(f"DEBUG UID: {bytes(self.cc.UID).hex()}")
+                                self.cc.UID_SHA1= hashlib.sha1(bytes(self.cc.UID)).hexdigest()
+                                logger.debug(f"DEBUG UID_SHA1: {self.cc.UID_SHA1}")
+                                break
+                            except Exception as exc:
+                                logger.warning(f"Error during CPLC/IIN/CIN: {repr(exc)}")
+                                time.sleep(0.1)
+
                 # todo: skip or not for reset_factory?
                 if self.cc.client is not None:
-                    self.cc.client.request('update_status',True)   
+                    self.cc.client.request('update_status',True)
                 
             except Exception as exc:
                 logger.warning(f"Error during connection: {repr(exc)}")
