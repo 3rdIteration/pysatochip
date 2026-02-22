@@ -18,12 +18,7 @@
 from ecdsa import SigningKey, SECP256k1, ECDH
 import binascii, json, hmac, hashlib, argparse, logging
 
-import cryptography
-from cryptography import exceptions
-from cryptography.hazmat.primitives.ciphers import Cipher as CG_Cipher
-from cryptography.hazmat.primitives.ciphers import algorithms as CG_algorithms
-from cryptography.hazmat.primitives.ciphers import modes as CG_modes
-from cryptography.hazmat.backends import default_backend as CG_default_backend
+from Cryptodome.Cipher import AES
 
 from pysatochip.JCconstants import *
 
@@ -74,9 +69,8 @@ def Decrypt_Secret(privateKey, export_data):
 			raise Exception("WARNING: MAC Mismatch (Encrypted Data is invalid, tampered or corrupt)")
 
 		# Decrypt Secret
-		cipher = CG_Cipher(CG_algorithms.AES(decryption_key), CG_modes.CBC(exported_iv), backend=CG_default_backend())
-		decryptor = cipher.decryptor()
-		raw_secret = decryptor.update(exported_secret_data) + decryptor.finalize()
+		cipher = AES.new(bytes(decryption_key), AES.MODE_CBC, bytes(exported_iv))
+		raw_secret = cipher.decrypt(bytes(exported_secret_data))
 
 		try: # First just try for text based secrets like mnemonics or general password
 			decrypted_secret = raw_secret.split(b'\x00')[0][1:].decode()
