@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]:
+
+Fixes:
+* pysatochip/JCconstants.py: add missing `0xC1: 'Descriptor'` entry to `SEEDKEEPER_DIC_TYPE` — without it, secrets of type Descriptor returned by the card caused a `KeyError` / `None` lookup failure.
+* satochip_cli.py: fix `seedkeeper_export_secret` command so that `Password`, `Descriptor`, and `Data` secrets are correctly decoded and displayed as human-readable plaintext rather than falling through to an incorrect code path.
+
 ## [0.15.1]:
 
 Add support for Seedkeeper v0.2:
