@@ -36,8 +36,7 @@ SEEDKEEPER_DIC_TYPE = {
     0x91: 'Master Password', 
     0xA0: 'Authentikey certificate', 
     0xB0: '2FA secret',
-    0xC0: 'Data',
-    0xC1: 'Descriptor'
+    0xC0: 'Data'
 }
 
 SEEDKEEPER_DIC_ORIGIN = {0x01: 'Plaintext import', 0x02: 'Encrypted import', 0x03: 'Generated on card'}
@@ -180,13 +179,14 @@ class JCconstants:
     INS_SETUP =  0x2A;
 
     # Keys' use and management
-    INS_GEN_KEYPAIR =  0x30;
-    INS_GEN_KEYSYM =  0x31;
-    INS_IMPORT_KEY =  0x32;
-    INS_EXPORT_KEY =  0x34;
-    INS_GET_PUBLIC_FROM_PRIVATE= 0x35;
-    INS_COMPUTE_CRYPT =  0x36;
-    INS_COMPUTE_SIGN =  0x37; # added
+    INS_GEN_KEYPAIR = 0x30
+    INS_GEN_KEYSYM = 0x31
+    INS_IMPORT_KEY = 0x32
+    INS_RESET_KEY = 0x33
+    INS_EXPORT_KEY = 0x34
+    INS_GET_PUBLIC_FROM_PRIVATE = 0x35
+    INS_COMPUTE_CRYPT = 0x36
+    INS_COMPUTE_SIGN = 0x37  # added
 
     # External authentication
     INS_CREATE_PIN =  0x40;
@@ -237,6 +237,7 @@ class JCconstants:
     INS_SET_ALLOWED_CARD_AID = 0x95;
     INS_GET_ALLOWED_CARD_AID = 0x96;
     INS_EXPORT_PKI_PUBKEY = 0x98;
+    INS_IMPORT_PKI_NDEF_AUTHENTIKEY = 0x9B;
     INS_LOCK_PKI = 0x99;
     INS_CHALLENGE_RESPONSE_PKI= 0x9A;
 

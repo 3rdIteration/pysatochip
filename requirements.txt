@@ -5,4 +5,3 @@ cryptography>=3.3.2
 pyopenssl>=20.0.0 # for certificate chain validation
 pycryptodomex>=3.18 # fallback when OpenSSL is unavailable
 certifi
-
