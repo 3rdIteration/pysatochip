@@ -15,24 +15,36 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-import click, logging, time, binascii, json, hashlib, base64, sys
-from os import urandom, environ
+import traceback
 from getpass import getpass
+from hashlib import sha256
+from os import urandom, environ
+import base64
+import cbor2 # for cashu
+import binascii
+import json
+import logging
+import sys
+import time
+from typing import Tuple, Dict, List, Any
 
-from ecdsa import SigningKey, SECP256k1, ECDH
+import click
+import websockets
+import asyncio
+import math
+from ecdsa import SECP256k1, ECDH
 from mnemonic import Mnemonic
+from nostr.event import Event, EventKind
+from smartcard.System import readers
 
-from pysatochip.CardConnector import (CardConnector, UninitializedSeedError, SeedKeeperError, 
-    IncorrectUnlockCodeError, IncorrectP1Error, IncorrectUnlockCounterError, IncorrectKeyslotStateError, 
-    IncorrectProtocolMediaError, IdentityBlockedError, WrongPinError)
+from pysatochip.CardConnector import (CardConnector, IncorrectUnlockCodeError, IncorrectUnlockCounterError,
+                                      IdentityBlockedError, WrongPinError, CardObjectAlreadyPresentError)
 from pysatochip.JCconstants import *
 from pysatochip.Satochip2FA import Satochip2FA, SERVER_LIST
-from pysatochip.version import SATOCHIP_PROTOCOL_MAJOR_VERSION, SATOCHIP_PROTOCOL_MINOR_VERSION, SATOCHIP_PROTOCOL_VERSION
-from pysatochip.util import msg_magic, list_hyphenated_values, dict_swap_keys_values
 from pysatochip.SecretDecryption import Decrypt_Secret
 from pysatochip.electrum_mnemonic import Mnemonic as electrum_mnemonic
 from pysatochip.electrum_mnemonic import seed_type as electrum_seedtype
+from pysatochip.util import list_hyphenated_values, dict_swap_keys_values
 
 # CardConnector Object used by everything
 global cc
@@ -41,8 +53,10 @@ logging.basicConfig(level=logging.WARNING, format='%(levelname)s [%(module)s] %(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
+
 def mnemonic_to_masterseed(bip39_mnemonic, bip39_passphrase, mnemonic_type):
     print(mnemonic_type)
+    mnemonic_masterseed = None
     if "BIP39" in mnemonic_type:
         mnemonic_obj = Mnemonic("english")
         if mnemonic_obj.check(bip39_mnemonic):
@@ -67,6 +81,7 @@ def mnemonic_to_entropy(bip39_mnemonic, wordlist):
 
     return entropy # bytearray
 
+
 def entropy_to_mnemonic(entropy_bytes, wordlist):
     print(f"Worldlist: {wordlist}")
 
@@ -74,6 +89,7 @@ def entropy_to_mnemonic(entropy_bytes, wordlist):
     mnemonic = mnemonic_obj.to_mnemonic(entropy_bytes)
 
     return mnemonic # str
+
 
 def do_challenge_response(msg):
     (id_2FA, msg_out) = cc.card_crypt_transaction_2FA(msg, True)
@@ -102,6 +118,32 @@ def do_challenge_response(msg):
         reply_decrypt = reply_decrypt.split(":")
         hmac = reply_decrypt[1]
     return hmac  # return a hexstring
+
+
+async def broadcast_event_async(event, relay_url):
+    """Broadcasts a Nostr event to a relay via websocket"""
+    logger.debug(f"Event string to publish: {event}")
+
+    try:
+        async with websockets.connect(relay_url) as websocket:
+            logger.debug(f"Connected to {relay_url}")
+            await websocket.send(event)
+
+            print("Event sent, awaiting response...")
+
+            response = await websocket.recv()
+            print(f"Received response: {response}")
+
+    except Exception as e:
+        logger.warning(f"Error broadcasting event: {e}")
+
+
+def broadcast_event(event, relay):
+    """Synchronous wrapper for broadcast_event_async"""
+    #loop = asyncio.get_event_loop()./
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(broadcast_event_async(event, relay))
+
 
 # Accept any prefix of a command name.
 #
@@ -139,7 +181,7 @@ def main(verbose, devicefilter):
     # Unless devicefilter has been specified, infer it based off the command (if possible)
     if not devicefilter:
         command_type = sys.argv[1].split("-")[0]
-        if command_type in ["satochip", "seedkeeper", "satodime"]:
+        if command_type in ["satochip", "seedkeeper", "satodime", "satocash"]:
             devicefilter = command_type
 
     if "util-" not in sys.argv[1][:5]:
@@ -170,6 +212,10 @@ def main(verbose, devicefilter):
         pass
 
     logger.debug("In main() end")
+
+"""##############################
+#        COMMON FUNCTIONS       #        
+##############################"""
 
 @main.command()
 def common_get_card_type():
@@ -253,6 +299,51 @@ def common_set_card_label(label):
         print(e)
 
 @main.command()
+def common_get_card_ndef():
+    """Retrieves the ndef tag for the card"""
+    try:
+        if cc.card_type != "Satodime":
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+        (response, sw1, sw2, ndef_bytes) = cc.card_get_ndef()
+        print("Device ndef:", ndef_bytes.hex())
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--ndef", default="", help="Device NDEF in hexadecimal.")
+def common_set_card_ndef(ndef):
+    """Sets a ndef value for the card (Optional)
+    For example:
+    - google.com is 000fD1010B5502676F6F676C652E636F6D
+    - Android app org.satochip.satodimeapp is 002Ad40f18616e64726f69642e636f6d3a706b676f72672e7361746f636869702e7361746f64696d65617070
+    """
+    try:
+        if cc.card_type != "Satodime":
+            # TODO: for satodime, may fail if performed via NFC (needs ownership)
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+
+        ndef_bytes = bytes.fromhex(ndef)
+        (response, sw1, sw2) = cc.card_set_ndef(ndef_bytes)
+        if sw1 != 0x90 or sw2 != 0x00:
+            print("ERROR: Set ndef Failed with error code: {hex(256*sw1+sw2)}")
+        else:
+            print("Device ndef Updated")
+    except Exception as e:
+        print(e)
+
+@main.command()
 @click.option("--nfc-policy", default=0, help="NFC Policy: 0 = NFC_ENABLED, 1 = NFC_DISABLED, 2 = NFC_BLOCKED")
 def common_set_nfc_policy(nfc_policy):
     """Sets the NFC interface policy: enable/disable/block card communication through NFC.
@@ -284,7 +375,42 @@ def common_set_nfc_policy(nfc_policy):
         elif (sw1 == 0x9C and sw2 == 0x49):
             print("Cannot set the NFC policy: NFC interface is BLOCKED, a factory reset is required to reenable NFC!")
         else:
-            print(f"Failed to set NFC policy with error code: {hex(sw1)}{hex(sw2)}")
+            print(f"Failed to set NFC policy with error code: {hex(256*sw1+sw2)}")
+
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--feature-id", default=0, help="Feature ID: 0 = FEATURE_ID_SCHNORR, 1 = FEATURE_ID_NOSTR, 2 = FEATURE_ID_LIQUID")
+@click.option("--feature-policy", default=0, help="Feature Policy: 0 = FEATURE_ENABLED, 1 = FEATURE_DISABLED, 2 = FEATURE_BLOCKED")
+def common_set_feature_policy(feature_id, feature_policy):
+    """Sets the feature usage policy: enable/disable/block the feature with given ID.
+    WARNING: if the policy is set to 2 (FEATURE_BLOCKED), it can only be reenabled through a factory reset!"""
+
+    try:
+        if (feature_policy == 2):
+            if click.confirm("Are you sure that you want to block feature? Feature can only be reenabled with factory reset!", default=False):
+                # we don't try to recover PIN from environment variables for destructive operations
+                pin = getpass("Enter your PIN:")
+            else:
+                print("Blocking feature cancelled!")
+                exit()
+        else:
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+
+        cc.card_verify_PIN(pin)
+        (response, sw1, sw2) = cc.card_set_feature_policy(feature_id, feature_policy)
+        if (sw1 == 0x90 and sw2 == 0x00):
+            print("New feature policy applied successfully!")
+        elif (sw1 == 0x9C and sw2 == 0x4B):
+            print("Cannot set the feature policy: feature is BLOCKED, a factory reset is required to reenable it!")
+        else:
+            print(f"Failed to set feature policy with error code: {hex(256*sw1+sw2)}")
 
     except Exception as e:
         print(e)
@@ -345,11 +471,162 @@ def common_initial_setup(label):
     if len(label) > 0:
         common_set_card_label(["--label", label])
 
+"""##############################
+#        COMMON PIN MGMT        #        
+##############################"""
+
+@main.command()
+def common_verify_PIN():
+    """Verify that the pin supplied by --pin matches the current device pin"""
+    try:
+        pin = getpass("Enter your PIN:")
+        (response, sw1, sw2) = cc.card_verify_PIN(pin)
+        if sw1 != 0x90 or sw2 != 0x00:
+            print("ERROR: Incorrect Pin Supplied")
+        else:
+            print("Correct Pin Verified")
+
+    except Exception as e:
+        print(e)
+
+@main.command()
+def common_change_PIN():
+    """Change the card PIN"""
+
+    pin = getpass("Enter your current PIN:")
+    new_pin = getpass("Enter your new PIN:")
+    new_pin2 = getpass("Confirm your new PIN:")
+    if new_pin != new_pin2:
+        print("ERROR! The two new PINs provided do not match!")
+        exit()
+
+    pin = list(pin.encode('utf8'))
+    new_pin = list(new_pin.encode('utf8'))
+    response, sw1, sw2 = cc.card_change_PIN(0, pin, new_pin)
+    if sw1 == 0x90 and sw2 == 0x00:
+        print("Success: Pin Changed")
+    if sw1 == 0x63:
+        print("Failed: Incorrect PIN")
+
+"""##############################
+#           COMMON PKI          #        
+##############################"""
+
+@main.command()
+def common_export_perso_pubkey():
+    """Export the personalisation pubkey from the device"""
+    try:
+        # PIN required except for satodime
+        if cc.card_type != "Satodime":
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+        print(binascii.hexlify(bytearray(cc.card_export_perso_pubkey())).decode())
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--cert", default=None, help="The device certificate (base64 encoded)")
+@click.option("--cert-file", default=None, help="The device certificate file (base64 encoded)")
+def common_import_perso_certificate(cert, cert_file):
+    """Import a personalisation certificate into the device"""
+    if cert_file:
+        with open(cert_file, 'r', encoding='utf-8') as f:
+                    cert = f.read()
+        cert = cert.replace("-----BEGIN CERTIFICATE-----", "").replace("-----END CERTIFICATE-----", "")
+
+    # TODO: can only import certificate before setup is done
+    # no user pin required
+    cc.card_import_perso_certificate(cert)
+
+@main.command()
+def common_export_perso_certificate():
+    """Export the personalisation certificate that is on the device"""
+    if cc.card_get_status()[3]['setup_done'] == False:
+        print("Unable to perform this function until setup is complete")
+        return
+    try:
+        # PIN required except for satodime
+        if cc.card_type != "Satodime":
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+        print(cc.card_export_perso_certificate())
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--privkey", default=None, help="The device NDEF authentikey to import (hex encoded)")
+def common_import_ndef_authentikey(privkey):
+    """Import the NDEF authentikey privkey on the card."""
+    try:
+        print(f"cardtype: {cc.card_type}")
+
+        # PIN required except for satodime
+        if cc.card_type != "Satodime":
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+
+        privkey_bytes = bytes.fromhex(privkey)
+        response, sw1, sw2 = cc.card_import_ndef_authentikey(privkey_bytes)
+
+        print(f"response: {hex(sw1*256+sw2)}")
+
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--backend", type=click.Choice(["auto", "openssl", "pycryptodomex"]), default="auto", help="Certificate validation backend")
+def common_verify_authenticity(backend):
+    if cc.card_get_status()[3]['setup_done'] == False:
+        print("Unable to perform this function until setup is complete")
+        return
+
+    """Verify the authenticy of the currently connected card"""
+    try:
+
+        # PIN required except for satodime
+        if cc.card_type != "Satodime":
+            # get PIN from environment variable or interactively
+            if 'PYSATOCHIP_PIN' in environ:
+                pin= environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+
+        is_authentic, txt_ca, txt_subca, txt_device, txt_error = cc.card_verify_authenticity(backend=backend)
+        print("Card is authentic:", is_authentic)
+        print("CA Cert:", txt_ca)
+        print("SubCA Cert:", txt_subca)
+        print("Device Cert:", txt_device)
+        print("Error:", txt_error)
+    except Exception as e:
+        print(e)
+
+"""##############################
+#        SATOCHIP IMPORTS       #        
+##############################"""
+
 @main.command()
 @click.option("--use-passphrase", is_flag=True, help="Use a BIP39 Passphrase")
 def satochip_import_new_mnemonic(use_passphrase):
     """Generates and imports a new BIP39 mnemonic to the SatoChip Device"""
     if click.confirm("WARNING: This tool should only be used to generate a new seed if run in a secure, offline environment. (Like TAILS Linux)  \nAre you sure that you want to do this?", default=False):
+        passphrase = ""
         if use_passphrase:
             passphrase = input("Enter your passphrase:")
         mnemo = Mnemonic("english")
@@ -409,7 +686,8 @@ def satochip_import_unencrypted_mnemonic(use_passphrase, electrum):
         mnemonic_type = "BIP39"
         if electrum: 
             mnemonic_type = "Electrum"
-        mnemonic = input("Enter your mnemonic seed:") 
+        mnemonic = input("Enter your mnemonic seed:")
+        passphrase = ""
         if use_passphrase:
             passphrase = input("Enter your passphrase:") 
         seed = mnemonic_to_masterseed(mnemonic, passphrase, mnemonic_type)
@@ -531,7 +809,7 @@ def satochip_reset_seed():
             if (sw1 == 0x90 and sw2 == 0x00):
                 print("Seed reset successfully!\nYou can now load a new seed")
             else:
-                print(f"Failed to reset seed with error code: {hex(sw1)}{hex(sw2)}")
+                print(f"Failed to reset seed with error code: {hex(256*sw1+sw2)}")
 
         except Exception as e:
             print(e)
@@ -588,9 +866,323 @@ def satochip_bip32_get_xpub(path, xtype, is_mainnet):
         print(e)
 
 @main.command()
+def satochip_bip32_get_liquid_master_blinding_key():
+    """Get the Liquid-Bitcoin Master Blinding Key. This is required on the host side to unblind output amounts in Liquid-Bitcoin confidential transactions"""
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        master_blinding_key = bytes(cc.card_bip32_get_liquid_master_blinding_key())
+        print(f"Liquid-Bitcoin Master Blinding Key: {master_blinding_key.hex()}")
+
+    except Exception as e:
+        print(e)
+
+"""##############################
+#       SATOCHIP PRIVKEY        #        
+##############################"""
+
+@main.command()
+@click.option("--keyslot", required=True, help="the keyslot where the key should be imported (0-16)")
+@click.option("--privkey", required=True, help="the 32byte private key in hex format")
+def satochip_import_privkey(keyslot, privkey):
+    """Imports a given private ECkey into the card at given keyslot
+    The keyslot provided should be available.
+    The private key should be in hex format (exactly 64 hex chars)
+    """
+    try:
+        keyslot = int(keyslot)
+        # convert privkey hex to bytes
+        privkey_bytes = bytes.fromhex(privkey)
+
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+        # check if 2FA is required
+        if (cc.needs_2FA==None):
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+        # import private key
+        cc.satochip_import_privkey(keyslot, privkey_bytes)
+        print(f"Private key imported successfully!")
+
+    except Exception as ex:
+        print(f"Exception during private key import: {ex}")
+
+
+@main.command()
+@click.option("--keyslot", required=True, help="the keyslot where the key should be imported (0-16)")
+def satochip_reset_privkey(keyslot):
+    """Reset the private ECkey at given keyslot"""
+    try:
+        keyslot = int(keyslot)
+
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+        # check if 2FA is required
+        hmac=b''
+        if (cc.needs_2FA==None):
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+        # reset private key
+        cc.satochip_reset_privkey(keyslot)
+        print(f"Private key reset successfully!")
+
+    except Exception as ex:
+        print(f"Exception during private key import: {ex}")
+
+@main.command()
+@click.option("--keyslot", required=True, help="the keyslot where the key should be imported (0-16)")
+def satochip_get_pubkey_from_keyslot(keyslot):
+    """return the public key associated with a particular private key stored
+    at a given keyslot.
+    """
+    try:
+        keyslot = int(keyslot)
+
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+        # check if 2FA is required
+        hmac=b''
+        if (cc.needs_2FA==None):
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+        # export pubkey
+        pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
+        print(f"pubkey for slot {keyslot}: {pubkey.get_public_key_bytes(compressed=False).hex()}")
+        print(f"pubkey for slot {keyslot}: {pubkey.get_public_key_bytes(compressed=True).hex()}")
+
+    except Exception as ex:
+        print(f"Exception during private key import: {ex}")
+
+
+"""##############################
+#       SATOCHIP SIGNATURE      #        
+##############################"""
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
+@click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
+@click.option("--hash", required=True, help="The hash to sign as hex string")
+def satochip_sign_hash(hash: str, keyslot, path):
+    """Sign a hash with the Satochip"""
+
+    hash_bytes = bytes.fromhex(hash)
+    hash_list = list(hash_bytes)
+
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+        # check if 2FA is required
+        hmac=b''
+        if cc.needs_2FA is None:
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+        # derive key and sign message
+        keyslot = int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath)= cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode)= cc.card_bip32_get_extendedkey(bytepath)
+        (response2, sw1, sw2) = cc.card_sign_transaction_hash(keyslot, hash_list, hmac)
+        if response2 == []:
+            print("Wrong signature: the 2FA device may have rejected the action.")
+        else:
+            print("Signature (hex):", bytes(response2).hex())
+
+    except Exception as e:
+        print(e)
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
+@click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
+@click.option("--hash", required=True, help="The hash to sign as hex string")
+def satochip_sign_schnorr_hash(hash: str, keyslot, path):
+    """Sign a hash with the Satochip using schnorr signature
+    If keyslot is provided, use the private key loaded at given keyslot.
+    Else if path is provided, use key derived from the BIP32 seed at given path.
+    If none is provided, use default path m/44'/0'/0'/0/0 and BIP32 derivation.
+    """
+
+    # todo: check version support (must be >=0.14)
+
+    hash_bytes = bytes.fromhex(hash)
+    hash_list = list(hash_bytes)
+
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+        # check if 2FA is required
+        hmac = None
+        if cc.needs_2FA is None:
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+        # derive key
+        keyslot = int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath) = cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode) = cc.card_bip32_get_extendedkey(bytepath)
+            print(f"pubkey for BIP32 derivation: {pubkey.get_public_key_bytes(compressed=False).hex()}")
+        else:
+            pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
+            print(f"pubkey for slot {keyslot}: {pubkey.get_public_key_bytes(compressed=False).hex()}")
+
+        # tweak key
+        tweak = None
+        (response, sw1, sw2) = cc.card_taproot_tweak_privkey(keyslot, tweak, bypass_flag=False)
+        print(f"pubkey after tweak: {bytes(response).hex()}")
+
+        # sign hash
+        (response2, sw1, sw2) = cc.card_sign_schnorr_hash(keyslot, hash_list, hmac)
+        if response2 == []:
+            print("Wrong signature: the 2FA device may have rejected the action.")
+        else:
+            print("Signature (hex):", bytes(response2).hex())
+
+    except Exception as e:
+        print(e)
+
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
+@click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
+@click.option("--message", prompt="Enter your message", help="Message for the Nostr event")
+@click.option("--kind", default="1", help="Kind for the Nostr event")
+@click.option("--broadcast", is_flag=True, default=False, help="Broadcast the event to the relay")
+@click.option("--relay", default="wss://relay.damus.io", help="Nostr relay URL to use")
+def satochip_sign_nostr_event(keyslot, path: str, message: str, kind: str, broadcast: bool, relay: str):
+    """Sign a Nostr event with the Satochip using schnorr signature.
+    The signed event can also be brodacasted on request.
+    If keyslot is provided, use the private key loaded at given keyslot.
+    Else if path is provided, use key derived from the BIP32 seed at given path.
+    If none is provided, use default path m/44'/0'/0'/0/0 and BIP32 derivation.
+    """
+
+    # todo: check version support (must be >=0.14)
+
+    # derive & export pubkey from card
+    compressed_pubkey = None
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # check if 2FA is required
+        if cc.needs_2FA == None:
+            (response, sw1, sw2, d) = cc.card_get_status()
+        if cc.needs_2FA:
+            raise ValueError("Required 2FA not supported currently!")
+
+        # derive key
+        keyslot = int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath) = cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode) = cc.card_bip32_get_extendedkey(bytepath)
+            print(f"pubkey for BIP32 derivation: {pubkey.get_public_key_bytes(compressed=False).hex()}")
+        else:
+            pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
+
+        # export pubkey
+        #pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
+        compressed_pubkey = pubkey.get_public_key_bytes(compressed=True).hex()
+        print(f"Recovered pubkey: {compressed_pubkey}")
+
+    except Exception as ex:
+        print(f"Exception during public key export: {ex}")
+
+    # Create Nostr event
+    kind = int(kind)
+    event = Event(
+        kind=EventKind(kind),
+        content=message,
+        public_key=compressed_pubkey[2:] # remove compression byte
+    )
+    event_id = event.id
+    print(f"Unsigned event: {event.to_message()}")
+    print(f"Unsigned event id: {event_id}")
+
+    # Sign the event
+    signature = ""
+    try:
+        click.echo("Signing event")
+        hash_bytes = bytes.fromhex(event_id)
+        hash_list = list(hash_bytes)
+
+        # tweak key (or bypass)
+        # todo: currently bypass tweak by default
+        tweak = None
+        (response, sw1, sw2) = cc.card_taproot_tweak_privkey(keyslot, tweak, bypass_flag=True)
+        print(f"pubkey after tweak: {bytes(response).hex()}")
+
+        # sign hash
+        hmac = None # 2FA not supported yet
+        (response2, sw1, sw2) = cc.card_sign_schnorr_hash(keyslot, hash_list, hmac)
+        if response2 == []:
+            print("Wrong signature: the 2FA device may have rejected the action.")
+        else:
+            signature = str(bytes(response2).hex())
+
+    except Exception as e:
+        print(e)
+
+    # Display, verify & broadcast the event
+    event.signature = signature
+    print(f"Signed event: {event.to_message()}")
+    print(f"Signed event Hash: {event.id}")
+
+    # Validate the Signature
+    is_verified = event.verify()
+    print(f"Signed event is_verified: {is_verified}")
+
+    if broadcast:
+        click.echo("\nBroadcasting event to relay...")
+        broadcast_event(event.to_message(), relay)
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
 @click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
 @click.option("--message", required=True, help="The message to sign")
-def satochip_sign_message(path, message):
+def satochip_sign_message(message, keyslot, path):
     """Sign a Message with the Satochip"""
     message_byte = message.encode('utf8')
 
@@ -605,27 +1197,149 @@ def satochip_sign_message(path, message):
         # check if 2FA is required
         hmac=b''
         if (cc.needs_2FA==None):
-            (response, sw1, sw2, d)=client.cc.card_get_status()
+            (response, sw1, sw2, d) = cc.card_get_status()
         if cc.needs_2FA:
             # challenge based on sha256(btcheader+msg)
             # format & encrypt msg
-            msg= {'action':"sign_msg", 'msg':message}
-            msg=  json.dumps(msg)
-            #do challenge-response with 2FA device...
-            hmac= do_challenge_response(msg)
-            hmac= bytes.fromhex(hmac)
-        # derive key and sign message
-        keynbr= 0xFF #for extended key
-        (depth, bytepath)= cc.parser.bip32path2bytes(path)
-        (pubkey, chaincode)= cc.card_bip32_get_extendedkey(bytepath)
-        (response2, sw1, sw2, compsig) = cc.card_sign_message(keynbr, pubkey, message_byte, hmac)
-        if (compsig==b''):
-            raise Exception("Wrong signature!\nThe 2FA device may have rejected the action.")
+            msg = {'action':"sign_msg", 'msg':message}
+            msg = json.dumps(msg)
+            # do challenge-response with 2FA device...
+            hmac = do_challenge_response(msg)
+            hmac = bytes.fromhex(hmac)
+        # derive key
+        keyslot= int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath)= cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode)= cc.card_bip32_get_extendedkey(bytepath)
+        else:
+            pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
+        # sign message
+        (response2, sw1, sw2, compsig) = cc.card_sign_message(keyslot, pubkey, message_byte, hmac)
+        if  compsig == b'':
+            print("Wrong signature: the 2FA device may have rejected the action.")
         else:
             print("Signature (Base64):", base64.b64encode(compsig).decode())
 
     except Exception as e:
         print(e)
+
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
+@click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
+@click.option("--message", required=False, help="The message to sign as 0-32 bytes hex string")
+@click.option("--aggpk", required=False, help="The aggregated pubkey as 32-byte hex string")
+@click.option("--extra", required=False, help="Extra data as 0-32 bytes hex string")
+def satochip_musig2_generate_nonce(keyslot, path, message, aggpk, extra):
+
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # derive key
+        keyslot = int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath) = cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode) = cc.card_bip32_get_extendedkey(bytepath)
+
+        # setup satochip using python3 -B satochip_cli.py common-initial-setup
+        # first import test privkey "0202020202020202020202020202020202020202020202020202020202020202" in keyslot 1
+        # using python3 -B satochip_cli.py satochip-import-privkey --keyslot 1 --privkey 0202020202020202020202020202020202020202020202020202020202020202
+        # corresponding pubkey is 024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766
+        # using python3 -B satochip_cli.py satochip-get-pubkey-from-keyslot --keyslot 1
+
+        #aggpk = bytes.fromhex("0707070707070707070707070707070707070707070707070707070707070707")
+        #msg = bytes.fromhex("0101010101010101010101010101010101010101010101010101010101010101")
+        #msg = bytes.fromhex("")
+        #msg = None
+        #extra = bytes.fromhex("0808080808080808080808080808080808080808080808080808080808080808")
+        # "expected_secnonce": "B114E502BEAA4E301DD08A50264172C84E41650E6CB726B410C0694D59EFFB6495B5CAF28D045B973D63E3C99A44B807BDE375FD6CB39E46DC4A511708D0E9D2024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+        # "expected_pubnonce": "02F7BE7089E8376EB355272368766B17E88E7DB72047D05E56AA881EA52B3B35DF02C29C8046FDD0DED4C7E55869137200FBDBFE2EB654267B6D7013602CAED3115A"
+
+        if aggpk is not None:
+            aggpk = bytes.fromhex(aggpk)
+        if message is not None:
+            message = bytes.fromhex(message)
+        if extra is not None:
+            extra = bytes.fromhex(extra)
+
+        pubnonce, encrypted_secnonce = cc.card_musig2_generate_nonce(keynbr=keyslot, aggpk=aggpk, msg=message, extra=extra)
+        print(f"pubnonce: {pubnonce.hex()}")
+        print(f"encrypted_secnonce: {encrypted_secnonce.hex()}")
+
+    except Exception as e:
+        print(e)
+
+
+@main.command()
+@click.option("--keyslot", default="255", help="keyslot of the private key (for single-key wallet")
+@click.option("--path", default="m/44'/0'/0'/0/0", help="path: the full BIP32 path of the address")
+@click.option("--secnonce", required=True, help="The encrypted secnonce as 144 bytes hex string")
+@click.option("--b", required=True, help="The b value as 32 bytes hex string")
+@click.option("--ea", required=True, help="The e*a as 32-byte hex string")
+@click.option("--r_has_even_y", required=True, help="has_even_y(R) as true or false")
+@click.option("--ggacc_is_1", required=True, help="true if g*gacc is equal to 1, false otherwise")
+def satochip_musig2_sign_hash(keyslot, path, secnonce, b, ea, r_has_even_y, ggacc_is_1):
+
+    try:
+        # get PIN from environment variable or interactively
+        if 'PYSATOCHIP_PIN' in environ:
+            pin= environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # derive key
+        keyslot = int(keyslot)
+        if keyslot == 0xFF:
+            # 0xFF is for extended key, used if no keyslot is provided
+            (depth, bytepath) = cc.parser.bip32path2bytes(path)
+            (pubkey, chaincode) = cc.card_bip32_get_extendedkey(bytepath)
+
+        # test vector
+        # setup satochip using python3 -B satochip_cli.py common-initial-setup
+        # first import test privkey 7fb9e0e687ada1eebf7ecfe2f21e73ebdb51a7d450948dfe8d76d7f2d1007671 in keyslot
+        # using python3 -B satochip_cli.py satochip-import-privkey --keyslot 0 --privkey 7fb9e0e687ada1eebf7ecfe2f21e73ebdb51a7d450948dfe8d76d7f2d1007671
+        # corresponding pubkey is 03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9
+        # using python3 -B satochip_cli.py satochip-get-pubkey-from-keyslot --keyslot 0
+
+        #secnonce = bytes.fromhex("508B81A611F100A6B2B6B29656590898AF488BCF2E1F55CF22E5CFB84421FE61FA27FD49B1D50085B481285E1CA205D55C82CC1B31FF5CD54A489829355901F703935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9")
+        # b = bytes.fromhex("f6311d2583176bb178ec12973b760a2d733544d4c72b4b3a8c260f7679f7d9c6")
+        # ea = bytes.fromhex("f696bb3be7fc4ee399c173813d0bddded1471cfe8acf5f729b1610d489eb3600")
+        # r_has_even_y = False
+        # ggacc_is_1 = True
+        # psig_expected = "012ABBCB52B3016AC03AD82395A1A415C48B93DEF78718E62A7A90052FE224FB"
+
+        secnonce = bytes.fromhex(secnonce)
+        secnonce = secnonce + (144 - len(secnonce)) * bytes.fromhex("00")  # pad to reach 144 bytes
+
+        b = bytes.fromhex(b)
+        ea = bytes.fromhex(ea)
+        r_has_even_y = (r_has_even_y.lower() == "true")
+        print(f"r_has_even_y: {r_has_even_y}")
+        ggacc_is_1 = (ggacc_is_1.lower() == "true")
+        print(f"ggacc_is_1: {ggacc_is_1}")
+
+        psig = cc.card_musig2_sign_hash(keynbr=keyslot, secnonce=secnonce, b=b, ea=ea, r_has_even_y=r_has_even_y, ggacc_is_1=ggacc_is_1)
+        print(f"psig: {psig.hex()}")
+
+    except Exception as e:
+        print(e)
+
+
+
+
+"""##############################
+#          SATOCHIP 2FA         #        
+##############################"""
 
 @main.command()
 def satochip_import_unencrypted_2fa_key():
@@ -665,43 +1379,14 @@ def satochip_disable_2fa():
         if (sw1 == 0x90 and sw2 == 0x00):
             print("2fa reset successfully!")
         else:
-            print(f"Failed to reset 2fa with error code: {hex(sw1)}{hex(sw2)}")
+            print(f"Failed to reset 2fa with error code: {hex(256*sw1+sw2)}")
 
     except Exception as e:
         print(e)
 
-@main.command()
-def common_verify_PIN():
-    """Verify that the pin supplied by --pin matches the current device pin"""
-    try:
-        pin = getpass("Enter your PIN:")
-        (response, sw1, sw2) = cc.card_verify_PIN(pin)
-        if sw1 != 0x90 or sw2 != 0x00:
-            print("ERROR: Incorrect Pin Supplied")
-        else:
-            print("Correct Pin Verified")
-
-    except Exception as e:
-        print(e)
-
-@main.command()
-def common_change_PIN():
-    """Change the card PIN"""
-
-    pin = getpass("Enter your current PIN:")
-    new_pin = getpass("Enter your new PIN:")
-    new_pin2 = getpass("Confirm your new PIN:")
-    if new_pin != new_pin2:
-        print("ERROR! The two new PINs provided do not match!")
-        exit()
-
-    pin = list(pin.encode('utf8'))
-    new_pin = list(new_pin.encode('utf8'))
-    response, sw1, sw2 = cc.card_change_PIN(0, pin, new_pin)
-    if sw1 == 0x90 and sw2 == 0x00:
-        print("Success: Pin Changed")
-    if sw1 == 0x63:
-        print("Failed: Incorrect PIN")
+"""##############################
+#           FACTORY RESET       #
+##############################"""
 
 @main.command()
 def common_reset_factory():
@@ -744,6 +1429,10 @@ def common_reset_factory():
         else:
             print("Satochip below version v0.12-0.4 do not support factory reset!")
             return
+
+    elif cc.card_type == "Satocash":
+        # satocash only supports factory reset v2
+        common_reset_factory_new()
 
     else:
         print(f"Unsupported card type: {cc.card_type}")
@@ -792,7 +1481,6 @@ def common_reset_factory_legacy():
                 break
     return
 
-
 def common_reset_factory_new():
     """Initiate the Factory Reset Process
     New approach where reset to factory is trigerred when PIN and PUK is blocked (the card is basically unusable in this state)
@@ -826,8 +1514,7 @@ def common_reset_factory_new():
             break
         except WrongPinError as ex:
             print(ex)
-            pinRemaining = (ex.sw2 & ~0xc0)
-            print(f"pinRemaining: {pinRemaining}")
+            print(f"pinRemaining: {ex.pin_left}")
         except Exception as ex:
             print(ex)
 
@@ -881,9 +1568,9 @@ def common_reset_factory_new():
 
     return
 
-#################################
+"""##############################
 #           SEEDKEEPER          #        
-#################################               
+##############################"""
 
 @main.command()
 def seedkeeper_get_card_status():
@@ -904,7 +1591,6 @@ def seedkeeper_get_card_status():
     print(f"nb_logs_total: {dic['nb_logs_total']}")
     print(f"nb_logs_avail: {dic['nb_logs_avail']}")
     print(f"last_log: {dic['last_log']}")
-
 
 @main.command()
 @click.option("--label", required=True, help="Label for the secret")
@@ -1092,7 +1778,7 @@ def seedkeeper_import_secret(type, subtype, label, export_rights, use_passphrase
             bip39_entropy_bytes = mnemonic_to_entropy(secret, wordlist)
             bip39_entropy_list = list(bip39_entropy_bytes)
         except Exception as ex:
-            exit(e)
+            exit()
         bip39_passphrase_list = list(bytes(bip39_passphrase, 'utf-8'))
         try:
             masterseed_bytes= mnemonic_to_masterseed(secret, bip39_passphrase, 'BIP39 mnemonic')
@@ -1319,35 +2005,10 @@ def seedkeeper_export_secret(sid, pubkey_id, export_dict):
                         logger.warning(f"Error during passphrase decoding: {ex}")
                         passphrase = f"failed to decode passphrase bytes: {passphrase_bytes.hex()}"
 
-                    secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'
+                    secret_string= f'\nWordlist: {wordlist} \nBIP39 mnemonic: "{bip39_mnemonic}" \nPassphrase: "{passphrase}" \nMasterseed: {masterseed_hex}'  
 
                 elif stype == 'Password':
-
-                    password_length = secret_dict['secret_list'][0]
-                    try:
-                        login_length = secret_dict['secret_list'][password_length + 1]
-                        url_length = secret_dict['secret_list'][password_length + login_length + 2]
-                    except IndexError: # Older Seedkeeper software didn't include these optional fields
-                        login_length = 0
-                        url_length = 0
-
-                    secret_string = ""
-
-                    # Password is always present, so no need to test for this
-                    password_text = binascii.unhexlify(secret_dict['secret'])[1:password_length+1].decode()
-                    secret_string += "\nPassword:" + "\"" + password_text + "\""
-
-                    if login_length > 0:
-                        login_text = binascii.unhexlify(secret_dict['secret'])[
-                                     password_length + 2: password_length + login_length + 2].decode()
-                        secret_string += "\nLogin:" + "\"" + login_text + "\""
-
-                    if url_length > 0:
-                        url_text = binascii.unhexlify(secret_dict['secret'])[-url_length:].decode()
-                        secret_string += "\nURL:" + "\"" + url_text + "\""
-
-                elif stype in ('Descriptor', 'Data'):
-                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[2:].decode() + "\""
+                    secret_string = "\"" + binascii.unhexlify(secret_dict['secret'])[1:].decode() + "\""
 
                 else:
                     secret_string = "\"" + secret_dict['secret'][2:] + "\""
@@ -1487,7 +2148,6 @@ def seedkeeper_reset_secret(sid):
     except Exception as e:
         print(e)  
 
-
 @main.command()
 def seedkeeper_print_logs():
     """Prints Log of operations on device"""
@@ -1537,85 +2197,9 @@ def seedkeeper_print_logs():
     except Exception as e:
         print(e)
 
-@main.command()
-def common_export_perso_pubkey():
-    """Export the personalisation pubkey from the device"""
-    try:
-        # PIN required except for satodime
-        if cc.card_type != "Satodime":
-            # get PIN from environment variable or interactively
-            if 'PYSATOCHIP_PIN' in environ:
-                pin= environ.get('PYSATOCHIP_PIN')
-                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
-            else:
-                pin = getpass("Enter your PIN:")
-            cc.card_verify_PIN(pin)
-        print(binascii.hexlify(bytearray(cc.card_export_perso_pubkey())).decode())
-    except Exception as e:
-        print(e)
-
-@main.command()
-@click.option("--cert", default=None, help="The device certificate (base64 encoded)")
-@click.option("--cert-file", default=None, help="The device certificate file (base64 encoded)")
-def common_import_perso_certificate(cert, cert_file):
-    """Import a personalisation certificate into the device"""
-    if cert_file:
-        with open(cert_file, 'r', encoding='utf-8') as f:
-                    cert = f.read()
-        cert = cert.replace("-----BEGIN CERTIFICATE-----", "").replace("-----END CERTIFICATE-----", "")
-
-    # TODO: can only import certificate before setup is done
-    # no user pin required
-    cc.card_import_perso_certificate(cert)
-
-@main.command()
-def common_export_perso_certificate():
-    """Export the personalisation certificate that is on the device"""
-    if cc.card_get_status()[3]['setup_done'] == False:
-        print("Unable to perform this function until setup is complete")
-        return
-    try:
-        # PIN required except for satodime
-        if cc.card_type != "Satodime":
-            # get PIN from environment variable or interactively
-            if 'PYSATOCHIP_PIN' in environ:
-                pin= environ.get('PYSATOCHIP_PIN')
-                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
-            else:
-                pin = getpass("Enter your PIN:")
-            cc.card_verify_PIN(pin)
-        print(cc.card_export_perso_certificate())
-    except Exception as e:
-        print(e)
-
-@main.command()
-@click.option("--backend", type=click.Choice(["auto", "openssl", "pycryptodomex"]), default="auto", help="Certificate validation backend")
-def common_verify_authenticity(backend):
-    if cc.card_get_status()[3]['setup_done'] == False:
-        print("Unable to perform this function until setup is complete")
-        return
-
-    """Verify the authenticy of the currently connected card"""
-    try:
-
-        # PIN required except for satodime
-        if cc.card_type != "Satodime":
-            # get PIN from environment variable or interactively
-            if 'PYSATOCHIP_PIN' in environ:
-                pin= environ.get('PYSATOCHIP_PIN')
-                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
-            else:
-                pin = getpass("Enter your PIN:")
-            cc.card_verify_PIN(pin)
-
-        is_authentic, txt_ca, txt_subca, txt_device, txt_error = cc.card_verify_authenticity(backend=backend)
-        print("Card is authentic:", is_authentic)
-        print("CA Cert:", txt_ca)
-        print("SubCA Cert:", txt_subca)
-        print("Device Cert:", txt_device)
-        print("Error:", txt_error)
-    except Exception as e:
-        print(e)
+"""##############################
+#            SATODIME           #        
+##############################"""
 
 @main.command()
 def satodime_get_card_status():
@@ -1777,6 +2361,636 @@ def satodime_key_reset(slot, unlock_secret, unlock_counter):
         print()
         print("Updated Unlock Counter:", bytes(cc.unlock_counter).hex())
 
+"""##############################
+#            SATOCASH           #        
+##############################"""
+
+@main.command()
+def satocash_get_status():
+    """Get a Satocash card status"""
+    try:
+        response, sw1, sw2, dic_status = cc.satocash_get_status()
+        print(f"Status: {dic_status}")
+    except Exception as ex:
+        print(f"Error in satocash_get_status: {ex}")
+
+@main.command()
+@click.option("--url", help="mint url")
+def satocash_import_mint(url: str):
+    """Import a mint (url) into a Satocash. This is required to import keyset(s), then proof(s)"""
+    try:
+        # no pin required for status
+        response, sw1, sw2, index = cc.satocash_import_mint(url)
+        print(f"Mint {url} imported into card at index {index}")
+    except Exception as ex:
+        print(f"Error during import: {ex}")
+
+@main.command()
+@click.option("--index", help="Index of mint to export")
+def satocash_export_mint(index: str):
+    """Export a mint (url) from a Satocash at a given index"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        index = int(index)
+        response, sw1, sw2, url = cc.satocash_export_mint(index)
+        print(f"Mint url: {url}")
+    except Exception as ex:
+        print(f"Error during mint export: {ex}")
+
+@main.command()
+@click.option("--index", help="Index of mint to remove")
+def satocash_remove_mint(index: str):
+    """Remove a mint (url) from a Satocash at a given index"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        index = int(index)
+        response, sw1, sw2 = cc.satocash_remove_mint(index)
+        print(f"Mint removed from card")
+    except Exception as ex:
+        print(f"Error during mint removal: {ex}")
+
+@main.command()
+@click.option("--keyset-id", help="Keyset_id as 8-byte hex value")
+@click.option("--mint-index", help="Mint index in satocard")
+@click.option("--unit", default= "sat", help="Unit representation: sat, msat, USD, EUR")
+def satocash_import_keyset(keyset_id: str, mint_index: str, unit: str):
+    """Import a keyset into a Satocash. This is required to import proof(s)"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        dic_unit = {"sat":1, "msat":2, "USD":3, "EUR":4}
+        keyset_id_bytes = bytes.fromhex(keyset_id)
+        mint_index = int(mint_index)
+        unit = dic_unit[unit]
+
+        response, sw1, sw2, index = cc.satocash_import_keyset(keyset_id_bytes, mint_index, unit)
+        print(f"Keyset {keyset_id} imported into card at index {index}")
+
+    except Exception as ex:
+        print(f"Error during keyset import: {ex}")
+
+@main.command()
+@click.option("--index-list", help="list of keyset to fetch by index, in the form '1,2,4,6'.")
+def satocash_export_keysets(index_list_str: str):
+    """Export keysets info from a Satocash. Info includes keyset_id, mint_index and unit"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # parse list from string
+        # Split the string by commas
+        string_values = index_list_str.split(',')
+        # Convert each string value to integer, stripping whitespace
+        index_list = [int(value.strip()) for value in string_values]
+
+        response, sw1, sw2, keysets = cc.satocash_export_keysets(index_list)
+        print(f"Keysets: {keysets}")
+
+    except Exception as ex:
+        print(f"Error during keyset export: {ex}")
+
+
+@main.command()
+@click.option("--index", help="Index of keyset to remove")
+def satocash_remove_keyset(index: str):
+    """Remove a keyset from a Satocash at a given index"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        index = int(index)
+
+        response, sw1, sw2 = cc.satocash_remove_keyset(index)
+        print(f"Keyset removed from card")
+
+    except Exception as ex:
+        print(f"Error during keyset removal: {ex}")
+
+@main.command()
+@click.option("--keyset-index", help="Keyset-index in satocard")
+@click.option("--amount", help="amount")
+@click.option("--secret", help="ecash secret x as 32-byte hex representation")
+@click.option("--unblinded-key", help="ecash unblinded key as 32-byte hex representation")
+def satocash_import_proof(keyset_index: str, amount: str, secret: str, unblinded_key: str):
+    """Import a proof into a Satocash. Info includes keyset_index, amount, secret and unblinded-key"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # parse data from string
+        keyset_index = int(keyset_index)
+        amount_exponent = math.log(int(amount),2) # the amount is actually stored as the power 2 exponent in [0...63]
+        secret_bytes = bytes.fromhex(secret)
+        unblinded_key_bytes = bytes.fromhex(unblinded_key)
+
+        response, sw1, sw2, index = cc.satocash_import_proof(keyset_index, amount_exponent, secret_bytes, unblinded_key_bytes)
+        print(f"Token imported into card at index {index}")
+    except Exception as ex:
+        print(f"Error during import: {ex}")
+
+@main.command()
+@click.option("--index-list", help="list of proofs to fetch by index, in the form '1,2,4,6'.")
+def satocash_export_proofs(index_list: str):
+    """Export proofs from a Satocash. Info includes keyset_index, amount_exponent, secret, unblinded_key"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        # parse list from string
+        # Split the string by commas
+        string_values = index_list.split(',')
+        # Convert each string value to integer, stripping whitespace
+        index_list = [int(value.strip()) for value in string_values]
+        print(f"index_list: {index_list}")
+
+        proofs = cc.satocash_export_proofs(index_list)
+        print(f"Proofs: {proofs}")
+
+        # convert to tokenv4
+        # keep it simple: generate on token per proof
+        for proof in proofs:
+            try:
+                keyset_index = proof["keyset_index"]
+
+                # recover keyset id, unit & mint info
+                response, sw1, sw2, keysets, keysets_dic = cc.satocash_export_keysets([keyset_index])
+                keyset_id = keysets[0].get("id")
+                mint_index = keysets[0].get("mint_index")
+                unitByte = keysets[0].get("unit")
+                dic_unit = {1:"sat", 2:"msat", 3:"USD", 4:"EUR"}
+                unit = dic_unit[unitByte]
+
+                # recover mint_url
+                response, sw1, sw2, mint_url = cc.satocash_export_mint(index= mint_index)
+                print(f"mint_url: {mint_url}")
+
+                # generate tokenv4 dict
+                tokenv4_dic = {'m': mint_url, 'u': unit, 'd': 'Satocash token'}
+                token_dic = {}
+                token_dic['i'] = keyset_id
+                proof_dic = {
+                    'a': proof['amount'],
+                    's': proof['secret_hex'],
+                    'c': bytes.fromhex(proof['unblinded_key_hex'])
+                }
+                token_dic['p'] = [proof_dic]
+                tokenv4_dic['t'] = [token_dic]
+
+                # serialize token dic to string
+                tokenv4_str = satocash_serialize_tokenv4(tokenv4_dic)
+                print(f"tokenv4_str: {tokenv4_str}")
+
+            except Exception as ex:
+                print(f"Error while serializing proofs to tokens: {ex}")
+                print(traceback.format_exc())
+
+    except Exception as ex:
+        print(f"Error during proof export: {ex}")
+        print(traceback.format_exc())
+
+@main.command()
+@click.option("--unit", default="sat", help="Monetary unit for which we want info: sat, msat, USD or EUR")
+@click.option("--info-type", help="The info that we want for each proof: STATE, KEYSET_INDEX, AMOUNT, MINT_INDEX, UNIT")
+@click.option("--index-start", default=0, help="Starting index for proofs")
+@click.option("--index-size", default= 0, help="Number of index for which info is requested, starting from index-start")
+def satocash_get_proof_info(unit: str, info_type: str, index_start: str, index_size: str):
+    """Get proof info for a given subset of proofs"""
+    try:
+        # get PIN from environment variable or interactively
+        # todo: check pin policy?
+        if 'PYSATOCHIP_PIN' in environ:
+            pin = environ.get('PYSATOCHIP_PIN')
+            print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+        else:
+            pin = getpass("Enter your PIN:")
+        cc.card_verify_PIN(pin)
+
+        dic_unit = {"sat": 1, "msat": 2, "USD": 3, "EUR": 4}
+        dic_info = {"STATE":0, "KEYSET_INDEX":1, "AMOUNT":2, "MINT_INDEX":3, "UNIT":4}
+        unit = dic_unit[unit]
+        info_type = dic_info[info_type]
+        index_start = int(index_start)
+        index_size = int(index_size)
+        if index_size == 0:
+            # get all indexes
+            try:
+                response, sw1, sw2, dic_status = cc.satocash_get_status()
+                print(f"Status: {dic_status}")
+                index_size = dic_status.get('max_nb_proofs', 128)
+            except Exception as ex:
+                print(f"Error in satocash_get_status: {ex}")
+
+        response, sw1, sw2 = cc.satocash_get_proof_info(unit, info_type, index_start, index_size)
+        print(f"Token info (raw): {response}")
+        dic_unit_by_code = {1:"sat", 2:"msat", 3:"USD", 4:"EUR"}
+        dic_info_by_code = {0:"STATE", 1:"KEYSET_INDEX", 2:"AMOUNT", 3:"MINT_INDEX", 4:"UNIT"}
+        dic_state_by_code = {0:"STATE_EMPTY", 1:"STATE_UNSPENT", 2:"STATE_SPENT"}
+
+        print(f"Token info:")
+        for index, value in enumerate(response):
+            proof_info_str = value
+            if info_type == 0:
+                proof_info_str = dic_state_by_code.get(value, "UNKNOWN")
+            elif info_type == 2:
+                if value == 0xFF:
+                    # proof is empty or in another denomination unit
+                    proof_info_str = 0
+                else:
+                    if (value & 0x80)==0x80:
+                        # this is a spent proof, shown as negative
+                        proof_info_str = -(2**(value & 0x7f)) # value is actually the power 2 exponent (without the 'spent' flag)
+                    else:
+                        # this is an unspent proof
+                        proof_info_str = 2 ** value  # value is actually the power 2 exponent
+            elif info_type == 4:
+                proof_info_str = dic_unit_by_code.get(value, "UNKNOWN")
+
+            print(f"index: {index_start + index} - info: {proof_info_str} - type: {dic_info_by_code.get(info_type, "UNKNOWN")}")
+            # print(f"index: {index_start + index}")
+            # print(f"info_raw: {value}")
+            # print(f"info_str: {proof_info_str}")
+            # print(f"type_raw: {info_type}")
+            # print(f"type_str: {dic_info_by_code.get(info_type, "UNKNOWN")}")
+            # print("")
+
+    except Exception as ex:
+        print(f"Error while fetching proof info: {ex}")
+
+
+@main.command()
+@click.option("--unit", default="sat", help="Monetary unit for which we want info: sat, msat, USD or EUR")
+def satocash_get_balances(unit: str):
+    """Get balances for tokens stored in the card for a given currency unit, sorted by mints"""
+    try:
+        dic_info = {"STATE": 0, "KEYSET_INDEX": 1, "AMOUNT": 2, "MINT_INDEX": 3, "UNIT": 4}
+        dic_unit = {"sat": 1, "msat": 2, "USD": 3, "EUR": 4}
+        unit = dic_unit[unit]
+
+        # get status
+        response, sw1, sw2, status_dic = cc.satocash_get_status()
+        max_nb_mints = status_dic.get('max_nb_mints', 0)
+        nb_mints = status_dic.get('nb_mints', 0)
+        max_nb_proofs = status_dic.get('max_nb_proofs', 0)
+        nb_proofs = status_dic.get('nb_proofs', 0)
+        nb_unspent_proofs = status_dic.get('nb_unspent_proofs', 0)
+        print(f"max_nb_mints: {max_nb_mints}")
+        print(f"max_nb_proofs: {max_nb_proofs}")
+        print(f"nb_proofs: {nb_proofs}")
+        print(f"nb_unspent_proofs: {nb_unspent_proofs}")
+
+        # get PIN from environment variable or interactively
+        pin_policy = status_dic.get('pin_policy', 0x01)
+        if pin_policy>0x00:
+            if 'PYSATOCHIP_PIN' in environ:
+                pin = environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+
+        # get proof info in raw format
+        index_size=128
+        info_type_amount_exponent = dic_info['AMOUNT']
+        info_type_mint = dic_info['MINT_INDEX']
+        amount_exponents = []
+        mint_indexes = []
+        for index_start in range(0, max_nb_proofs, 128):
+            response, sw1, sw2 = cc.satocash_get_proof_info(unit, info_type_amount_exponent, index_start, index_size)
+            amount_exponents += response
+            response, sw1, sw2 = cc.satocash_get_proof_info(unit, info_type_mint, index_start, index_size)
+            mint_indexes += response
+        print(f"amount_exponents: {amount_exponents}")
+        print(f"mint_indexes: {mint_indexes}")
+
+
+        # compute balance for each mint
+        amount_unspent_by_mints = max_nb_mints * [0]
+        amount_spent_by_mints = max_nb_mints * [0]
+        mint_urls = max_nb_mints * ['']
+        for index in range(max_nb_proofs):
+            mint_index = mint_indexes[index]
+            amount_exponent = amount_exponents[index]
+            if amount_exponent == 0xFF:
+                amount = 0
+            else:
+                if amount_exponent & 0x80 == 0x80:
+                    # spent amount
+                    amount = 2**(amount_exponent & 0x7f)
+                    amount_spent_by_mints[mint_index] += amount
+                else:
+                    # unspent amount
+                    amount = 2 ** amount_exponent
+                    amount_unspent_by_mints[mint_index] += amount
+
+        print(f"UNSPENT AMOUNTS:")
+        for index in range(max_nb_mints):
+            if amount_unspent_by_mints[index]!=0:
+                # get mint info
+                response, sw1, sw2, url = cc.satocash_export_mint(index)
+                mint_urls[index] = url
+                print(f"balance: {amount_unspent_by_mints[index]} - mint: {url} - index: {index}")
+
+        print(f"SPENT AMOUNTS:")
+        for index in range(max_nb_mints):
+            if amount_spent_by_mints[index] != 0:
+                # get mint info
+                response, sw1, sw2, url = cc.satocash_export_mint(index)
+                mint_urls[index] = url
+                print(f"balance: {amount_spent_by_mints[index]} - mint: {url} - index: {index}")
+
+        return status_dic, mint_urls, amount_unspent_by_mints, amount_spent_by_mints
+
+    except Exception as ex:
+        print(f"Error while fetching balances: {ex}")
+
+@main.command()
+@click.option("--tokenv4", help="Cash tokenv4 serialized format (base64)")
+def satocash_import_tokenv4(tokenv4: str):
+    """Import a base64 serialized token into satocash"""
+
+    # get PIN from environment variable or interactively
+    # todo: check pin policy?
+    if 'PYSATOCHIP_PIN' in environ:
+        pin = environ.get('PYSATOCHIP_PIN')
+        print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+    else:
+        pin = getpass("Enter your PIN:")
+    cc.card_verify_PIN(pin)
+
+    json = satocash_deserialize_tokenv4(tokenv4)
+    print(f"token_json: {json}")
+
+    unit_str = json['u']
+    mint_url = json['m']
+    mint_index = -1
+    # import mint
+    try:
+        response, sw1, sw2, mint_index = cc.satocash_import_mint(mint_url)
+        print(f"Mint {mint_url} imported into card at index {mint_index}")
+    except Exception as ex:
+        print(f"Error during import: {ex}")
+        return
+
+    tokens = json['t']
+    # for each token
+    for token_dic in tokens:
+        keyset_id_bytes = token_dic['i']
+        keyset_index = 0
+        # import keyset_id
+        try:
+            dic_unit = {"sat": 1, "msat": 2, "USD": 3, "EUR": 4}
+            unit = dic_unit[unit_str]
+            print(f"unit: {unit}")
+            print(f"keyset_id_bytes: {keyset_id_bytes}")
+            print(f"mint_index: {mint_index}")
+
+            response, sw1, sw2, keyset_index = cc.satocash_import_keyset(keyset_id_bytes, mint_index, unit)
+            print(f"Keyset {keyset_id_bytes.hex()} imported into card at index {keyset_index}")
+        except Exception as ex:
+            print(f"Error during tokenv4 import: {ex}")
+            print(traceback.format_exc())
+            return
+
+        proofs = token_dic['p']
+        # for each proof
+        for proof_dic in proofs:
+            amount = proof_dic['a']
+            secret_hex = proof_dic['s']
+            unblinded_key_bytes = proof_dic['c']
+            if len(unblinded_key_bytes) != 33:
+                print(f"Wrong unblinded_key size: {len(unblinded_key_bytes)} (should be 33)")
+                return
+
+            # import proof
+            try:
+                # parse data from string
+                amount_exponent = int(math.log(int(amount),2)) # the amount is actually stored as the power 2 exponent in [0...63]
+                print(f"amount_exponent: {amount_exponent}")
+                secret_bytes = bytes.fromhex(secret_hex)
+                response, sw1, sw2, proof_index = cc.satocash_import_proof(keyset_index, amount_exponent, secret_bytes, unblinded_key_bytes)
+                print(f"Token imported into card at index {proof_index}")
+            except Exception as ex:
+                print(f"Error during tokenv4 import: {ex}")
+                print(traceback.format_exc())
+
+@main.command()
+@click.option("--unit", default="sat", help="Monetary unit for which we want info: sat, msat, USD or EUR")
+@click.option("--amount", help="minimum amount in token to export")
+def satocash_export_tokenv4(unit, amount):
+    """Export a base64 serialized token from satocash for at least a given amount"""
+    try:
+        amount = int(amount)
+
+        # get status
+        response, sw1, sw2, status_dic = cc.satocash_get_status()
+        max_nb_mints = status_dic.get('max_nb_mints', 0)
+        max_nb_keysets = status_dic.get('max_nb_keysets', 0)
+        nb_mints = status_dic.get('nb_mints', 0)
+        max_nb_proofs = status_dic.get('max_nb_proofs', 0)
+        nb_proofs = status_dic.get('nb_proofs', 0)
+        nb_unspent_proofs = status_dic.get('nb_unspent_proofs', 0)
+        print(f"max_nb_mints: {max_nb_mints}")
+        print(f"max_nb_keysets: {max_nb_keysets}")
+        print(f"max_nb_proofs: {max_nb_proofs}")
+        print(f"nb_proofs: {nb_proofs}")
+        print(f"nb_unspent_proofs: {nb_unspent_proofs}")
+
+        # get PIN from environment variable or interactively
+        pin_policy = status_dic.get('pin_policy', 0x01)
+        if pin_policy > 0x00:
+            if 'PYSATOCHIP_PIN' in environ:
+                pin = environ.get('PYSATOCHIP_PIN')
+                print("INFO: PIN value recovered from environment variable 'PYSATOCHIP_PIN'")
+            else:
+                pin = getpass("Enter your PIN:")
+            cc.card_verify_PIN(pin)
+
+        # get proof info in raw format
+        dic_info = {"STATE": 0, "KEYSET_INDEX": 1, "AMOUNT_EXPONENT": 2, "MINT_INDEX": 3, "UNIT": 4}
+        dic_unit = {"sat": 1, "msat": 2, "USD": 3, "EUR": 4}
+        index_size = 128
+        unit_byte = dic_unit[unit]
+        info_type_amount_exponent = dic_info['AMOUNT_EXPONENT']
+        info_type_mint = dic_info['MINT_INDEX']
+        info_type_keyset_index = dic_info['KEYSET_INDEX']
+        amount_exponents = []
+        mint_indexes = []
+        keyset_indexes = []
+        for index_start in range(0, max_nb_proofs, 128):
+            response, sw1, sw2 = cc.satocash_get_proof_info(unit_byte, info_type_amount_exponent, index_start, index_size)
+            amount_exponents += response
+            response, sw1, sw2 = cc.satocash_get_proof_info(unit_byte, info_type_mint, index_start, index_size)
+            mint_indexes += response
+            response, sw1, sw2 = cc.satocash_get_proof_info(unit_byte, info_type_keyset_index, index_start, index_size)
+            keyset_indexes += response
+        print(f"amount_exponents: {amount_exponents}")
+        print(f"mint_indexes: {mint_indexes}")
+        print(f"keyset_indexes: {keyset_indexes}")
+
+        # compute balance for each mint
+        # also list keysets by mint and proofs by keyset
+        amount_unspent_by_mints = max_nb_mints * [0]
+        keyset_indexes_by_mint = max_nb_mints * [set()]
+        proof_indexes_by_keyset = max_nb_keysets * [set()]
+        amount_available = 0
+        mint_index = None
+        for proof_index in range(max_nb_proofs):
+            mint_index = mint_indexes[proof_index]
+            amount_exponent = amount_exponents[proof_index]
+            keyset_index = keyset_indexes[proof_index]
+
+            # get proof amount
+            if (amount_exponent != 0xFF) and (amount_exponent & 0x80 == 0x00):
+                # unspent amount
+                proof_amount = 2 ** amount_exponent
+                amount_unspent_by_mints[mint_index] += proof_amount
+                keyset_indexes_by_mint[mint_index].add(keyset_index)
+                proof_indexes_by_keyset[keyset_index].add(proof_index)
+                if amount_unspent_by_mints[mint_index] >= amount:
+                    # we have reached a sufficient set of proofs
+                    amount_available = amount_unspent_by_mints[mint_index]
+                    break
+
+        # check that we have sufficient funds
+        if amount_available < amount:
+            print("Not enough funds available in one mint!")
+            print(f"Amount per mint: {amount_unspent_by_mints}")
+            return
+
+        # at this point, we have enough funds in the mint at mint_index
+        response, sw1, sw2, mint_url = cc.satocash_export_mint(mint_index)
+        print(f"mint_index: {mint_index}")
+        print(f"mint_url: {mint_url}")
+        print(f"amount_available: {amount_available}")
+
+        # select proofs by keysets and get ids from card
+        keyset_indexes_subset = keyset_indexes_by_mint[mint_index]
+        print(f"keyset_indexes_subset: {keyset_indexes_subset}")
+        response, sw1, sw2, keysets, keysets_dic = cc.satocash_export_keysets(list(keyset_indexes_subset))
+
+        # generate tokenv4 dict
+        tokenv4_dic = {'m': mint_url, 'u': unit, 'd': 'Satocash token'}
+        tokenv4_dic['t'] = []
+        for keyset_dic in keysets:
+            token_dic = {}
+
+            # get id from card
+            keyset_id = keyset_dic['id']
+            keyset_index = keyset_dic['index']
+            token_dic['i'] = keyset_id
+
+            # get proofs by keyset_index
+            token_dic['p'] = []
+            proof_indexes_subset = proof_indexes_by_keyset[keyset_index]
+            print(f"proof_indexes_subset: {proof_indexes_subset}")
+            # export proofs
+            proof_list = cc.satocash_export_proofs(list(proof_indexes_subset))
+            for proof in proof_list:
+                proof_dic = {
+                    'a':proof['amount'],
+                    's':proof['secret_hex'],
+                    'c':bytes.fromhex(proof['unblinded_key_hex'])
+                }
+                token_dic['p'] += [proof_dic]
+                print(f"proof_dic: {proof_dic}")
+
+            print(f"token_dic: {token_dic}")
+            tokenv4_dic['t'] += [token_dic]
+
+        print(f"tokenv4_dic: {tokenv4_dic}")
+
+        # serialize token dic to string
+        tokenv4_str = satocash_serialize_tokenv4(tokenv4_dic)
+        print(f"tokenv4_str: {tokenv4_str}")
+
+    except Exception as ex:
+        print(f"Error while exporting tokens: {ex}")
+        print(traceback.format_exc())
+
+def satocash_deserialize_tokenv4(tokenv4_serialized: str):
+    """
+    Ingesta a serialized "cashuB<cbor_urlsafe_base64>" token and returns a TokenV4 as json.
+    based on Nutshell
+    """
+    prefix = "cashuB"
+    assert tokenv4_serialized.startswith(prefix), Exception(
+        f"Token prefix not valid. Expected {prefix}."
+    )
+    token_base64 = tokenv4_serialized[len(prefix) :]
+    # if base64 string is not a multiple of 4, pad it with "="
+    token_base64 += "=" * (4 - len(token_base64) % 4)
+
+    token = cbor2.loads(base64.urlsafe_b64decode(token_base64))
+    return token
+
+
+def satocash_serialize_tokenv4(tokenv4_dic) -> str:
+    """
+    Takes a TokenV4 and serializes it as "cashuB<cbor_urlsafe_base64>.
+    """
+    prefix = "cashuB"
+    tokenv4_serialized = prefix
+    # encode the token as a base64 string
+    tokenv4_serialized += base64.urlsafe_b64encode(
+        cbor2.dumps(tokenv4_dic)
+    ).decode()
+    # remove padding
+    tokenv4_serialized = tokenv4_serialized.rstrip("=")
+    return tokenv4_serialized
+
+
+
+"""##############################
+#       SEEDKEEPER UTIL         #        
+##############################"""
+
 @main.command()
 @click.option("--json-file", required=True, help="File containing the encrypted secret")
 def util_decrypt_secret_export(json_file):
@@ -1802,6 +3016,18 @@ def util_generate_local_keypair():
     print("Privkey:", privkey.decode())
     print("Pubkey:", '04' + pubkey)
 
+
+@main.command()
+def util_find_card_reader():
+    available_readers = readers()
+    print("Available readers:", available_readers)
+
+    if available_readers:
+        connection = available_readers[0].createConnection()
+        connection.connect()
+        print("ATR:", connection.getATR())
+    else:
+        print("No readers available.")
 
 if __name__ == '__main__':
     main()

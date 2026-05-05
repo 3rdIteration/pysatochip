@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0]: 
+
+### Satocash support
+
+Supported commands:
+* satocash_get_status(self)
+* satocash_import_mint(self, url: str)
+* satocash_export_mint(self, index: int)
+* satocash_remove_mint(self, index: int)
+* satocash_import_keyset(self, keyset_id: bytes, mint_index: int, unit: int)
+* satocash_export_keysets(self, index_list: list[int])
+* satocash_remove_keyset(self, index: int)
+* satocash_import_proof(self, keyset_index: int, amount_exponent: int, secret_bytes: bytes, unblinded_key_bytes: bytes)
+* satocash_export_proofs(self, index_list: list[int])
+* satocash_get_proof_info(self, unit: int, info_type: int, index_start: int, index_size: int)
+
+### NDEF authentikey support
+
+PKI: add support for card_import_ndef_authentikey() APDU command
+This command imports the NDEF authentikey private key into the card (if supported).
+This is used to sign and authenticate NDEF record exchanged by tapping the card on a smartphone.
+The NDEF authentikey may be shared by multiple devices for better privacy.
+
+## [0.16.0]: 
+
+### add support for MuSig2 (WIP)
+
+* Add test class for musig2 (requires modified Satochip firmware)
+* Generic CLI commands for MuSig2
+* Encrypted secnonce: secnonce are exported in encrypted & authenticated format to reduce memory footprint
+* Implementation using test vectors from bip327 specification
+* Supported commands:
+  * card_musig2_generate_nonce(self, keynbr: int, aggpk: Optional[bytes], msg: Optional[bytes], extra: Optional[bytes])
+  * card_musig2_sign_hash(self, keynbr: int, secnonce: bytes, b: bytes, ea: bytes, r_has_even_y: bool, ggacc_is_1: bool)
+
+## [0.15.5]:
+
+* Add support for Liquid-Bitcoin Master Blinding Key export 
+* Add support to Enable/disable optional features in Satochip v0.14-0.5+
+
+## [0.15.4]:
+
+* Add support for Nostr event signature in satochip_cli CLI.
+```commandline
+python3 satochip_cli.py --verbose satochip-sign-nostr-event --keyslot 0 --message "Hello, world" --kind 1 --broadcast
+```
+
+## [0.15.3]:
+
+* Add support for Schnorr signatures:
+    - sign hash with card_sign_schnorr_hash()
+    - private key must be tweaked before signing using card_taproot_tweak_privkey()
+* Add support for single private key wallet:
+    - import a secp256k1 private key with satochip_import_privkey()
+    - reset a secp256k1 private key satochip_reset_privkey()
+    - recover the pubkey of a private key with satochip_get_pubkey_from_keyslot()
+* Also add suport for these functions in CLI.
+
+These functions are not yet supported when 2FA is enabled.
+
+Some examples:
+* Import a private key on slot #0:
+```commandline
+python3 satochip_cli.py --verbose satochip-import-privkey --keyslot 0 --privkey aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899
+```
+* Get the corresponding publick key:
+```commandline
+python3 satochip_cli.py satochip-get-pubkey-from-keyslot --keyslot 0
+```
+* Sign a hash with Schnorr on this slot:
+```commandline
+python3 satochip_cli.py satochip-sign-schnorr-hash --hash 796962c8f2a7b8540f818cbe37d2894b1ab4b71bccddced12e2a4dc11d8802c3 --keyslot 0
+```
+
+More CLI commands:
+* Get satochip_cli help:
+```commandline
+python3 satochip_cli.py
+```
+* Setup new card:
+```commandline
+python3 satochip_cli.py common-initial-setup --label my-card-label
+```
+
+## [0.15.2]:
+
+Add NDEF support:
+* get or set an NDEF tag for the card (if supported by the card)
+* also add support in command line tool
+
 ## [0.15.1]:
 
 Add support for Seedkeeper v0.2:
