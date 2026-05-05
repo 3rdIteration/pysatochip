@@ -29,13 +29,13 @@ setuptools.setup(
         'Github': 'https://github.com/Toporin',
         'Webshop': 'https://satochip.io/',
         'Telegram': 'https://t.me/Satochip',
-        'Twitter': 'https://twitter.com/satochip',
+        'Twitter': 'https://twitter.com/satochipwallet',
         'Source': 'https://github.com/Toporin/pysatochip/',
         'Tracker': 'https://github.com/Toporin/pysatochip/issues',
     },
     install_requires=requirements,
     extras_require={
-        "CLI": ["mnemonic", "click", "websockets", "nostr", "cbor2"],
+        "CLI": ["mnemonic", "click"],
     },
     packages=setuptools.find_packages(),
     package_dir={
