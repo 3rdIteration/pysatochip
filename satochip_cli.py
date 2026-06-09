@@ -21,21 +21,17 @@ from getpass import getpass
 from hashlib import sha256
 from os import urandom, environ
 import base64
-import cbor2 # for cashu
 import binascii
 import json
 import logging
 import sys
 import time
+import math
+import asyncio
 from typing import Tuple, Dict, List, Any
 
 import click
-import websockets
-import asyncio
-import math
 from ecdsa import SECP256k1, ECDH
-from mnemonic import Mnemonic
-from nostr.event import Event, EventKind
 from smartcard.System import readers
 
 from pysatochip.CardConnector import (CardConnector, IncorrectUnlockCodeError, IncorrectUnlockCounterError,
@@ -56,6 +52,7 @@ logger.setLevel(logging.WARNING)
 
 
 def mnemonic_to_masterseed(bip39_mnemonic, bip39_passphrase, mnemonic_type):
+    from mnemonic import Mnemonic
     print(mnemonic_type)
     mnemonic_masterseed = None
     if "BIP39" in mnemonic_type:
@@ -75,6 +72,7 @@ def mnemonic_to_masterseed(bip39_mnemonic, bip39_passphrase, mnemonic_type):
 
 
 def mnemonic_to_entropy(bip39_mnemonic, wordlist):
+    from mnemonic import Mnemonic
     print(f"Worldlist: {wordlist}")
 
     mnemonic_obj = Mnemonic(wordlist)
@@ -84,6 +82,7 @@ def mnemonic_to_entropy(bip39_mnemonic, wordlist):
 
 
 def entropy_to_mnemonic(entropy_bytes, wordlist):
+    from mnemonic import Mnemonic
     print(f"Worldlist: {wordlist}")
 
     mnemonic_obj = Mnemonic(wordlist)
@@ -123,6 +122,7 @@ def do_challenge_response(msg):
 
 async def broadcast_event_async(event, relay_url):
     """Broadcasts a Nostr event to a relay via websocket"""
+    import websockets
     logger.debug(f"Event string to publish: {event}")
 
     try:
@@ -141,7 +141,6 @@ async def broadcast_event_async(event, relay_url):
 
 def broadcast_event(event, relay):
     """Synchronous wrapper for broadcast_event_async"""
-    #loop = asyncio.get_event_loop()./
     loop = asyncio.new_event_loop()
     loop.run_until_complete(broadcast_event_async(event, relay))
 
@@ -1133,6 +1132,7 @@ def satochip_sign_nostr_event(keyslot, path: str, message: str, kind: str, broad
     Else if path is provided, use key derived from the BIP32 seed at given path.
     If none is provided, use default path m/44'/0'/0'/0/0 and BIP32 derivation.
     """
+    from nostr.event import Event, EventKind
 
     # todo: check version support (must be >=0.14)
 
@@ -3118,6 +3118,7 @@ def satocash_deserialize_tokenv4(tokenv4_serialized: str):
     Ingesta a serialized "cashuB<cbor_urlsafe_base64>" token and returns a TokenV4 as json.
     based on Nutshell
     """
+    import cbor2
     prefix = "cashuB"
     assert tokenv4_serialized.startswith(prefix), Exception(
         f"Token prefix not valid. Expected {prefix}."
@@ -3134,6 +3135,7 @@ def satocash_serialize_tokenv4(tokenv4_dic) -> str:
     """
     Takes a TokenV4 and serializes it as "cashuB<cbor_urlsafe_base64>.
     """
+    import cbor2
     prefix = "cashuB"
     tokenv4_serialized = prefix
     # encode the token as a base64 string
